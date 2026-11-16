@@ -1,14 +1,21 @@
-# Nobrain Fishing: background mode design
+# Фоновая работа — архитектура (проектирование)
 
-## Current behavior
-WASAPI audio detection can run while the remote-desktop window is not focused, but SendInput goes to the foreground Windows application. We must **not** send Space to Excel, a browser, or another foreground application.
+## Текущее ограничение
 
-## Proposed full background architecture
-- Run **Nobrain Worker** on the home PC next to WoW. It captures the game's local sound and performs detection and input there.
-- Run **Nobrain Controller** on the work PC. It shows status, session counts, logs, and sends Start/Pause/Stop commands; it never sends Space to the work desktop.
-- Connect over authenticated Tailscale or WireGuard. Do not open an unauthenticated control port on the public Internet.
-- Keep the WoW window active on the home desktop; this does not require the RustDesk window to remain active at work.
-- Worker should pause on lost connection or unexpected window focus, according to a configurable policy.
+В режиме RustDesk/AnyDesk/TeamViewer приложение умеет слушать виртуальное аудиоустройство, пока окно удалённого рабочего стола не активно. Но `SendInput` отправляет клавиши **активному окну Windows**. Поэтому программа не должна отправлять пробел, пока пользователь работает в браузере, Excel и т. п. Простое `PostMessage(WM_KEYDOWN)` в неактивный RustDesk не гарантирует доставку в WoW.
 
-## Scope
-**Design only:** the worker/controller network architecture is not implemented in v1.6. Current audio-only background monitoring is separate from remote keyboard control.
+## Рекомендуемая архитектура: домашний worker + удалённая панель
+
+- **Домашний компьютер:** WoW и процесс Nobrain Worker. Он захватывает локальный WASAPI-аудиопоток, выполняет распознавание и нажимает Space в локальном игровом сеансе. Здесь не нужен канал аудио RustDesk, а задержка ниже. WoW должен оставаться активным в домашней сессии (не блокировать экран/сеанс).
+- **Рабочий компьютер:** небольшая панель Nobrain Controller. Управляет Start/Pause/Stop, параметрами и показывает CAST/DETECT/BITE, статистику, журнал. Пробел локально на рабочем ПК не генерируется.
+- **Транспорт:** защищённый канал через Tailscale/WireGuard с авторизацией. Без открытых входящих портов в Интернет. При разрыве связи worker продолжает заданную политику (безопасный вариант — Pause).
+- **Поведение:** worker проверяет, что WoW активно, перед каждой отправкой ввода. Не использует запись памяти игры или инъекцию кода.
+- **Опционально:** стриминг отладочного изображения поплавка по запросу, вместо непрерывного захвата всего рабочего стола.
+
+## Альтернатива без домашнего worker
+
+Сохранить текущую модель: звуковой детектор работает в фоне на рабочем ПК, но отправка Space автоматически ставится на паузу, если окно удалённого доступа не активно. Можно включить уведомления о поклёвке, не трогая остальные приложения.
+
+## Что не реализовано в v1.6
+
+Домашний worker, сетевой протокол, авторизация контроллера и скрытая отправка клавиш. Этот документ — спецификация следующего этапа, а не заявление о готовой функциональности.
