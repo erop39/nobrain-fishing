@@ -1,14 +1,15 @@
-name: Windows EXE (no console)
+name: Nobrain Companion Windows
 on:
   workflow_dispatch:
   push:
     paths:
       - 'remote_fishing.py'
-      - 'NobrainFishing.spec'
+      - 'NobrainCompanion.spec'
       - 'requirements*.txt'
       - 'assets/**'
       - 'samples/**'
       - 'bite_sample.wav'
+      - '.github/workflows/windows-build.yml'
 jobs:
   build:
     runs-on: windows-latest
@@ -21,13 +22,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip pyinstaller
           python -m pip install -r requirements.txt -r requirements-optional.txt
-      - name: Build Windows EXE
-        run: pyinstaller --noconfirm --clean NobrainFishing.spec
-      - name: Package
+      - name: Build GUI EXE (no console)
+        run: pyinstaller --noconfirm --clean NobrainCompanion.spec
+      - name: Package portable build
         shell: pwsh
-        run: Compress-Archive -Path dist/NobrainFishing -DestinationPath NobrainFishing-Windows.zip
+        run: Compress-Archive -Path dist/NobrainCompanion -DestinationPath NobrainCompanion-Windows.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: NobrainFishing-Windows
-          path: NobrainFishing-Windows.zip
+          name: NobrainCompanion-Windows
+          path: NobrainCompanion-Windows.zip
           retention-days: 30
