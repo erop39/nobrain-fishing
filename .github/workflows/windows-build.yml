@@ -1,0 +1,33 @@
+name: Windows EXE (no console)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'remote_fishing.py'
+      - 'NobrainFishing.spec'
+      - 'requirements*.txt'
+      - 'assets/**'
+      - 'samples/**'
+      - 'bite_sample.wav'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m pip install -r requirements.txt -r requirements-optional.txt
+      - name: Build Windows EXE
+        run: pyinstaller --noconfirm --clean NobrainFishing.spec
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/NobrainFishing -DestinationPath NobrainFishing-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NobrainFishing-Windows
+          path: NobrainFishing-Windows.zip
+          retention-days: 30
