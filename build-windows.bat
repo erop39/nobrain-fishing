@@ -7,9 +7,9 @@ if errorlevel 1 goto :error
 if errorlevel 1 goto :error
 .venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-optional.txt
 if errorlevel 1 goto :error
-.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean NobrainFishing.spec
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean NobrainCompanion.spec
 if errorlevel 1 goto :error
-echo Success: dist\NobrainFishing\NobrainFishing.exe
+echo Success: dist\NobrainCompanion\NobrainCompanion.exe
 pause
 exit /b 0
 :error
