@@ -1,0 +1,28 @@
+name: Build modern Windows app
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install pyinstaller -r requirements.txt -r requirements-optional.txt
+      - name: Check safety logic and API
+        run: python -m unittest test_session_safety test_modern_desktop.SettingsTests test_modern_desktop.HttpHandlerTests -v
+      - name: Build Windows application
+        run: python -m PyInstaller --noconfirm --clean NobrainModern.spec
+      - name: Package portable build
+        shell: pwsh
+        run: Compress-Archive -Path dist/NobrainModern -DestinationPath NobrainModern-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NobrainModern-Windows
+          path: NobrainModern-Windows.zip
+          retention-days: 30
