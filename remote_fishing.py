@@ -18,6 +18,7 @@ import wave
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from ui_theme import COLORS, apply_theme, style_text, responsive_labels
 from datetime import datetime
 import traceback
 from contextlib import nullcontext
@@ -417,6 +418,8 @@ def emergency_stop_pressed() -> bool:
 class GlobalHotkeys:
     def __init__(self, events):
         self.events = events
+        self.manual_spaces = queue.Queue(maxsize=32)
+        self.space_hook_available = False
         self.thread_id = 0
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -425,6 +428,39 @@ class GlobalHotkeys:
 
     def _run(self):
         user32 = ctypes.windll.user32
+        wt = ctypes.wintypes
+        pointer = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+        class KeyboardEvent(ctypes.Structure):
+            _fields_ = [('vkCode', wt.DWORD), ('scanCode', wt.DWORD), ('flags', wt.DWORD),
+                        ('time', wt.DWORD), ('dwExtraInfo', pointer)]
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        user32.SetWindowsHookExW.argtypes = (ctypes.c_int, callback_type, wt.HINSTANCE, wt.DWORD)
+        user32.SetWindowsHookExW.restype = wt.HANDLE
+        user32.CallNextHookEx.argtypes = (wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = (wt.HANDLE,)
+        user32.GetForegroundWindow.restype = wt.HWND
+        held = False
+        @callback_type
+        def keyboard_hook(code, message, data):
+            nonlocal held
+            try:
+                if code >= 0:
+                    key = ctypes.cast(data, ctypes.POINTER(KeyboardEvent)).contents
+                    if key.vkCode == 0x20 and not (key.flags & 0x10):  # Ignore SendInput and keybd_event.
+                        if message in (0x0101, 0x0105):
+                            held = False
+                        elif message in (0x0100, 0x0104) and not held:
+                            held = True
+                            try: self.manual_spaces.put_nowait((time.monotonic(), int(user32.GetForegroundWindow() or 0)))
+                            except queue.Full: pass
+            except Exception:
+                pass  # Never prevent keyboard input reaching other applications.
+            return user32.CallNextHookEx(None, code, message, data)
+        hook = user32.SetWindowsHookExW(13, keyboard_hook, None, 0)
+        self.space_hook_available = bool(hook)
+        if not hook:
+            self.events.put(('log', 'HOTKEY | Manual SPACE detection unavailable'))
         self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
         # Force creation of a Win32 message queue before registration.
         msg = ctypes.wintypes.MSG()
@@ -441,6 +477,8 @@ class GlobalHotkeys:
                 self.events.put(('hotkey',int(msg.wParam)))
         for key_id in registered:
             user32.UnregisterHotKey(None,key_id)
+        if hook:
+            user32.UnhookWindowsHookEx(hook)
 
     def close(self):
         if self.thread_id:
@@ -506,12 +544,16 @@ class RangeSlider(ttk.Frame):
         self.active = None
         self.caption = ttk.Label(self, text='', font=('Segoe UI', 10, 'bold'))
         self.caption.pack(anchor='w')
-        self.canvas = tk.Canvas(self, height=41, highlightthickness=0, cursor='hand2')
+        self.canvas = tk.Canvas(self, height=41, highlightthickness=2, highlightbackground=COLORS['surface'],
+                                highlightcolor=COLORS['accent'], background=COLORS['surface'],
+                                takefocus=True, cursor='hand2')
         self.canvas.pack(fill='x')
         self.canvas.bind('<Configure>', self.redraw)
         self.canvas.bind('<Button-1>', self.mouse_down)
         self.canvas.bind('<B1-Motion>', self.mouse_move)
         self.canvas.bind('<ButtonRelease-1>', self.mouse_up)
+        self.canvas.bind('<Left>', lambda e: self.key_adjust(-1, e))
+        self.canvas.bind('<Right>', lambda e: self.key_adjust(1, e))
         low_var.trace_add('write', lambda *_: self.redraw())
         high_var.trace_add('write', lambda *_: self.redraw())
         self.redraw()
@@ -526,7 +568,15 @@ class RangeSlider(ttk.Frame):
         value = min(self.upper, max(self.lower, round(value/self.step)*self.step))
         return round(value, self.decimals)
 
+    def key_adjust(self, direction, event):
+        variable = self.high_var if event.state & 0x1 else self.low_var
+        lo = self.low_var.get() if variable is self.high_var else self.lower
+        hi = self.upper if variable is self.high_var else self.high_var.get()
+        variable.set(round(max(lo, min(hi, variable.get() + direction * self.step)), self.decimals))
+        return 'break'
+
     def mouse_down(self, event):
+        self.canvas.focus_set()
         lo, hi = self.x_for(self.low_var.get()), self.x_for(self.high_var.get())
         self.active = 'min' if abs(event.x-lo) <= abs(event.x-hi) else 'max'
         self.mouse_move(event)
@@ -545,10 +595,10 @@ class RangeSlider(ttk.Frame):
         self.canvas.delete('all')
         lo, hi = self.x_for(self.low_var.get()), self.x_for(self.high_var.get())
         width = max(34, self.canvas.winfo_width()-17)
-        self.canvas.create_line(17, 21, width, 21, width=6, fill='#CBD5E1', capstyle='round')
-        self.canvas.create_line(lo, 21, hi, 21, width=6, fill='#1687BD', capstyle='round')
+        self.canvas.create_line(17, 21, width, 21, width=6, fill=COLORS['line'], capstyle='round')
+        self.canvas.create_line(lo, 21, hi, 21, width=6, fill=COLORS['accent'], capstyle='round')
         for x in (lo, hi):
-            self.canvas.create_oval(x-9, 12, x+9, 30, fill='#FFFFFF', outline='#1687BD', width=3)
+            self.canvas.create_oval(x-9, 12, x+9, 30, fill=COLORS['surface'], outline=COLORS['accent'], width=3)
         self.caption.config(text=f'{self.low_var.get():.{self.decimals}f}–{self.high_var.get():.{self.decimals}f} сек.')
 
 
@@ -561,12 +611,16 @@ class SingleSlider(ttk.Frame):
         self.dragging = False
         self.caption = ttk.Label(self, font=('Segoe UI', 10, 'bold'))
         self.caption.pack(anchor='w')
-        self.canvas = tk.Canvas(self, height=41, highlightthickness=0, cursor='hand2')
+        self.canvas = tk.Canvas(self, height=41, highlightthickness=2, highlightbackground=COLORS['surface'],
+                                highlightcolor=COLORS['accent'], background=COLORS['surface'],
+                                takefocus=True, cursor='hand2')
         self.canvas.pack(fill='x')
         self.canvas.bind('<Configure>', self.redraw)
         self.canvas.bind('<Button-1>', self.mouse_down)
         self.canvas.bind('<B1-Motion>', self.mouse_move)
         self.canvas.bind('<ButtonRelease-1>', self.mouse_up)
+        self.canvas.bind('<Left>', lambda e: self.key_adjust(-1))
+        self.canvas.bind('<Right>', lambda e: self.key_adjust(1))
         variable.trace_add('write', lambda *_: self.redraw())
         self.redraw()
 
@@ -580,7 +634,13 @@ class SingleSlider(ttk.Frame):
         stepped = round((raw-self.lower)/self.step)*self.step+self.lower
         return round(max(self.lower, min(self.upper, stepped)), self.decimals)
 
+    def key_adjust(self, direction):
+        value = self.variable.get() + direction * self.step
+        self.variable.set(round(max(self.lower, min(self.upper, value)), self.decimals))
+        return 'break'
+
     def mouse_down(self, event):
+        self.canvas.focus_set()
         self.dragging = True
         self.mouse_move(event)
 
@@ -597,9 +657,9 @@ class SingleSlider(ttk.Frame):
         self.canvas.delete('all')
         x = self.x_for(self.variable.get())
         right = max(34, self.canvas.winfo_width()-17)
-        self.canvas.create_line(17, 21, right, 21, width=6, fill='#CBD5E1', capstyle='round')
-        self.canvas.create_line(17, 21, x, 21, width=6, fill='#1687BD', capstyle='round')
-        self.canvas.create_oval(x-9, 12, x+9, 30, fill='#FFFFFF', outline='#1687BD', width=3)
+        self.canvas.create_line(17, 21, right, 21, width=6, fill=COLORS['line'], capstyle='round')
+        self.canvas.create_line(17, 21, x, 21, width=6, fill=COLORS['accent'], capstyle='round')
+        self.canvas.create_oval(x-9, 12, x+9, 30, fill=COLORS['surface'], outline=COLORS['accent'], width=3)
         self.caption.config(text=f'{self.variable.get():.{self.decimals}f} {self.unit}')
 
 
@@ -607,8 +667,9 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title('Nobrain Companion v1.6.3')
-        root.geometry(f'900x{min(650, max(480, root.winfo_screenheight()-110))}')
-        root.minsize(760, 470)
+        root.geometry(f'1020x{min(760, max(520, root.winfo_screenheight()-100))}')
+        root.minsize(820, 520)
+        self.ui_style = apply_theme(root)
         self.events = queue.Queue()
         self.close_behavior = tk.StringVar(value='tray')
         self.working_mode = tk.StringVar(value='Удалённо')
@@ -646,6 +707,9 @@ class App:
         self.audio_name = tk.StringVar(value='System default')
         self.threshold = tk.DoubleVar(value=0.65)
         self.timeout = tk.IntVar(value=30)
+        self.no_splash_stop = tk.BooleanVar(value=False)
+        self.no_splash_seconds = tk.IntVar(value=300)
+        self.manual_space_reset = tk.BooleanVar(value=True)
         self.early_bite_filter = tk.BooleanVar(value=False)
         self.min_bite_seconds = tk.IntVar(value=0)
         self.cooldown = tk.DoubleVar(value=1.8)  # legacy setting
@@ -677,46 +741,50 @@ class App:
             except (tk.TclError, ValueError):
                 pass
 
-        # Persistent control/status bar; functionality is grouped in four tabs.
-        shell = ttk.Frame(root, padding=(14, 12))
-        shell.pack(fill='both', expand=True)
-        header = ttk.Frame(shell)
+        # A shared header and controls stay visible across all seven tabs.
+        header = ttk.Frame(root, style='Header.TFrame', padding=(22, 16))
         header.pack(fill='x')
+        brand = ttk.Frame(header, style='Header.TFrame')
+        brand.pack(side='left', fill='x', expand=True)
+        ttk.Label(brand, text='Nobrain Companion', style='HeaderTitle.TLabel').pack(anchor='w')
+        ttk.Label(brand, text='Рыбалка WoW · звук, поплавок и управление сессией',
+                  style='HeaderSub.TLabel').pack(anchor='w', pady=(3, 0))
+        ttk.Label(header, text='FISHING  /  1.6.3', style='HeaderTag.TLabel').pack(side='right', padx=(12, 0))
         if PIL_AVAILABLE:
             try:
                 mark = Image.open((ROOT / 'assets' / 'nobrain.png') if (ROOT / 'assets' / 'nobrain.png').is_file() else (RESOURCE_ROOT / 'assets' / 'nobrain.png')).convert('RGBA')
-                mark.thumbnail((42, 42))
+                mark.thumbnail((58, 58))
                 self._brand_icon = ImageTk.PhotoImage(mark)
-                ttk.Label(header, image=self._brand_icon).pack(side='left', padx=(0, 9))
+                ttk.Label(header, image=self._brand_icon, style='Header.TLabel').pack(side='right', padx=8)
             except Exception as exc:
                 self.post(f'BRAND | Logo not loaded: {exc}')
-        ttk.Label(header, text='Nobrain Companion', font=('Segoe UI', 15, 'bold')).pack(side='left')
-        ttk.Label(shell, text='Локальный WoW или удалённый сеанс · распознавание звука и изображения',
-                  foreground='#667085').pack(anchor='w', pady=(1, 5))
-        if not PIL_AVAILABLE:
-            ttk.Label(shell, text='⚠ Pillow отсутствует: режим пикселей и иконка в трее недоступны. Звуковой режим работает.',
-                      foreground='#A16207', wraplength=850).pack(anchor='w', pady=(0, 4))
-        elif pystray is None:
-            ttk.Label(shell, text='⚠ pystray отсутствует: сворачивание в трей недоступно. Остальные режимы работают.',
-                      foreground='#A16207', wraplength=850).pack(anchor='w', pady=(0, 8))
-
+        tk.Frame(root, height=2, background=COLORS['lavender_line']).pack(fill='x')
+        shell = ttk.Frame(root, padding=(18, 12, 18, 12))
+        shell.pack(fill='both', expand=True)
         bar = ttk.Frame(shell)
-        bar.pack(fill='x', pady=(0, 3))
-        self.start_button = ttk.Button(bar, text='▶ Старт', command=self.start)
+        bar.pack(fill='x', pady=(0, 10))
+        self.start_button = ttk.Button(bar, text='Старт', command=self.start, style='Primary.TButton', width=9)
         self.start_button.pack(side='left')
-        ttk.Button(bar, text='⏸ Пауза / Продолжить', command=self.toggle_pause).pack(side='left', padx=7)
-        ttk.Button(bar, text='■ Стоп', command=self.halt).pack(side='left', padx=7)
-        ttk.Button(bar, text='Сохранить настройки', command=self.save_settings).pack(side='left')
-        ttk.Button(bar, text='Окно логов', command=self.open_log_viewer).pack(side='right')
-        ttk.Label(shell, textvariable=self.state, font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(2, 1))
-        ttk.Label(shell, textvariable=self.score, foreground='#667085').pack(anchor='w', pady=(0, 5))
+        ttk.Button(bar, text='Пауза / продолжить', command=self.toggle_pause).pack(side='left', padx=(8, 0))
+        ttk.Button(bar, text='Стоп', command=self.halt).pack(side='left', padx=(8, 0))
+        ttk.Button(bar, text='Сохранить настройки', command=self.save_settings).pack(side='left', padx=(18, 0))
+        ttk.Button(bar, text='Журнал', command=self.open_log_viewer).pack(side='right')
+        status_bar = ttk.Frame(shell, style='Status.TFrame', padding=(12, 7))
+        status_bar.pack(fill='x', pady=(0, 12))
+        ttk.Label(status_bar, textvariable=self.state, style='Status.TLabel').pack(anchor='w')
+        ttk.Label(status_bar, textvariable=self.score, style='StatusDetail.TLabel', wraplength=720).pack(anchor='w', pady=(2, 0))
+        if not PIL_AVAILABLE or pystray is None:
+            detail = 'Визуальный режим и трей недоступны' if not PIL_AVAILABLE else 'Сворачивание в трей недоступно'
+            ttk.Label(shell, text=detail + ' · настройка на вкладке «Компоненты»',
+                      foreground=COLORS['warning']).pack(anchor='w', pady=(0, 8))
 
         notebook = ttk.Notebook(shell)
         notebook.pack(fill='both', expand=True)
+        self.notebook = notebook
         def scrolling_tab(title):
             outer = ttk.Frame(notebook)
             notebook.add(outer, text=title)
-            canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+            canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0, background=COLORS['surface'])
             scrollbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
             scrollbar.pack(side='right', fill='y')
             canvas.pack(side='left', fill='both', expand=True)
@@ -737,14 +805,14 @@ class App:
             outer.bind('<Leave>', unbind_wheel)
             return inner
 
-        fishing = scrolling_tab('🎣 Рыбалка')
-        audio = scrolling_tab('🔊 Звук')
-        vision = scrolling_tab('👁 Пиксели')
-        remote = scrolling_tab('⌨ Подключение')
-        stats = scrolling_tab('📊 Статистика')
-        components = scrolling_tab('⚙ Компоненты')
+        fishing = scrolling_tab('Рыбалка')
+        audio = scrolling_tab('Звук')
+        vision = scrolling_tab('Поплавок')
+        remote = scrolling_tab('Подключение')
+        stats = scrolling_tab('Статистика')
+        components = scrolling_tab('Компоненты')
         logs = ttk.Frame(notebook, padding=10)
-        notebook.add(logs, text='📋 Журнал')
+        notebook.add(logs, text='Журнал')
 
         fishing.columnconfigure(0, weight=1)
         action_group = ttk.LabelFrame(fishing, text='Автоматизация', padding=12)
@@ -752,9 +820,9 @@ class App:
         ttk.Checkbutton(action_group, text='Автоматически нажимать SPACE (заброс + подсечка)',
                         variable=self.automation).pack(anchor='w')
         ttk.Label(action_group, text='Требуется аддон Forever Fishing для заброса и взаимодействия одной клавишей SPACE.',
-                  foreground='#A15D08', wraplength=660).pack(anchor='w', pady=(5, 0))
+                  foreground=COLORS['warning'], wraplength=660).pack(anchor='w', pady=(5, 0))
         ttk.Label(action_group, text='Без галочки программа только слушает звук и фиксирует поклёвки.',
-                  foreground='#667085').pack(anchor='w', pady=(5, 0))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(5, 0))
 
         def fields_block(parent, title, fields):
             group = ttk.LabelFrame(parent, text=title, padding=12)
@@ -766,7 +834,7 @@ class App:
                 cell.grid(row=i//3, column=i%3, sticky='ew', padx=(0, 14), pady=5)
                 ttk.Label(cell, text=label).pack(anchor='w')
                 ttk.Entry(cell, textvariable=var, width=16).pack(anchor='w', pady=(4, 2))
-                ttk.Label(cell, text=hint, foreground='#667085').pack(anchor='w')
+                ttk.Label(cell, text=hint, foreground=COLORS['muted']).pack(anchor='w')
             return group
 
         timing_content = ttk.Frame(fishing)
@@ -786,7 +854,7 @@ class App:
         ttk.Label(early_box,
             text='Ранние всплески полностью игнорируются и записываются как BITE_IGNORED. '
                  'Отсчёт начинается после каждого заброса; 0 сек. / выключено — без фильтра.',
-            foreground='#667085', wraplength=650
+            foreground=COLORS['muted'], wraplength=650
         ).pack(anchor='w', pady=(5, 0))
         reaction_box = ttk.LabelFrame(timing_content, text='После звука поклёвки — задержка подсечки', padding=12)
         reaction_box.pack(fill='x', pady=(0, 12))
@@ -796,9 +864,19 @@ class App:
         RangeSlider(pause_box, self.recast_delay_min, self.recast_delay_max, 0.0, 8.0, 0.1, 1).pack(fill='x')
         session_box = ttk.LabelFrame(stats, text='Статистика текущей сессии', padding=12)
         session_box.pack(fill='x', pady=(0, 12))
-        ttk.Label(session_box, textvariable=self.count, font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(0, 12))
+        metrics = ttk.Frame(session_box)
+        metrics.pack(fill='x', pady=(0, 16))
+        self.metric_vars = [tk.StringVar(value='0') for _ in range(3)]
+        for column, (title, variable) in enumerate(zip(
+                ('Забросы', 'Поклёвки', 'Оценка улова'), self.metric_vars)):
+            metrics.columnconfigure(column, weight=1, uniform='metric')
+            cell = ttk.Frame(metrics, padding=(12, 4))
+            cell.grid(row=0, column=column, sticky='ew')
+            ttk.Label(cell, text=title, style='Muted.TLabel').pack(anchor='w')
+            ttk.Label(cell, textvariable=variable,
+                      style='MetricMint.TLabel' if column == 2 else 'Metric.TLabel').pack(anchor='w', pady=(3, 0))
         ttk.Label(session_box, text='«Поймано» — приблизительная оценка по отправленным подсечкам. Пустые поклёвки и срывы не определяются автоматически.',
-                  foreground='#667085', wraplength=700).pack(anchor='w')
+                  foreground=COLORS['muted'], wraplength=700).pack(anchor='w')
         stats_buttons = ttk.Frame(session_box)
         stats_buttons.pack(anchor='w', pady=(12,0))
         ttk.Button(stats_buttons, text='−1 улов', command=lambda: self.adjust_catches(-1)).pack(side='left')
@@ -806,7 +884,7 @@ class App:
         ttk.Button(stats_buttons, text='Сброс статистики', command=self.reset_stats).pack(side='left')
         ttk.Label(fishing, text='Порядок: SPACE → до 30 с ожидания → поклёвка и задержка → SPACE → пауза → SPACE.\n'
                   'Если за 30 с поклёвки нет: пауза → новый заброс.',
-                  foreground='#667085', justify='left').grid(row=2, column=0, sticky='w')
+                  foreground=COLORS['muted'], justify='left').grid(row=2, column=0, sticky='w')
 
         device_group = ttk.LabelFrame(audio, text='Источник звука Windows', padding=12)
         device_group.pack(fill='x', pady=(0, 12))
@@ -856,11 +934,11 @@ class App:
                      values=modes, width=27).pack(anchor='w', pady=(5,8))
         if not PIL_AVAILABLE:
             ttk.Label(visual_group, text='Для визуального режима установи Pillow: .venv\\Scripts\\python.exe -m pip install Pillow',
-                      foreground='#A16207').pack(anchor='w')
+                      foreground=COLORS['warning']).pack(anchor='w')
         ttk.Label(visual_group, text='Звук + свой поплавок: чужой всплеск сам по себе не запускает подсечку.\n'
                   'Для реакции необходимы звук и изменение изображения выбранного поплавка в пределах 1.5 с.\n'
                   'Экспериментально: движение воды, перекрытое окно или потеря поплавка мешают детекции.',
-                  foreground='#667085', wraplength=680).pack(anchor='w')
+                  foreground=COLORS['muted'], wraplength=680).pack(anchor='w')
         vr = ttk.Frame(visual_group)
         vr.pack(fill='x', pady=4)
         ttk.Button(vr, text='Выделить область поплавка на экране', command=self.choose_visual_region,
@@ -877,7 +955,7 @@ class App:
         ttk.Label(locate_row, text='Фотография: обрезанный PNG/JPG с поплавком, без большого участка воды.\n'
                   'Поиск идёт по экрану, после нахождения — в динамической рамке.\n'
                   'Нужно Pillow + opencv-python; на RustDesk захват экрана должен показывать игру.',
-                  foreground='#667085').pack(anchor='w', pady=4)
+                  foreground=COLORS['muted']).pack(anchor='w', pady=4)
         photorow = ttk.Frame(locate_row)
         photorow.pack(fill='x')
         ttk.Button(photorow, text='Выбрать фото поплавка…', command=self.choose_bobber_photo).pack(side='left')
@@ -886,7 +964,7 @@ class App:
         ttk.Label(visual_group, text='Визуальный режим пока экспериментальный: после заброса программа запоминает\n'
                   'область спустя 2.5 с и ищет последовательные изменения.\n'
                   'Для исходного проверенного поведения выбери «Звук».',
-                  foreground='#667085').pack(anchor='w', pady=(5,0))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(5,0))
 
         mode_group = ttk.LabelFrame(remote, text='Режим работы', padding=12)
         mode_group.pack(fill='x', pady=(0, 12))
@@ -896,7 +974,7 @@ class App:
                         value='Локально', command=self.on_mode_changed).pack(anchor='w', pady=(5, 0))
         ttk.Label(mode_group, text='Локальный режим: риск блокировки учётной записи может быть выше, поскольку программа работает рядом с игрой.\n'
                   'Автоопределение и выбор процесса не обеспечивают безопасность от античита.',
-                  foreground='#A15D08', wraplength=710).pack(anchor='w', pady=(7, 0))
+                  foreground=COLORS['warning'], wraplength=710).pack(anchor='w', pady=(7, 0))
         process_row = ttk.Frame(mode_group)
         process_row.pack(fill='x', pady=(8, 2))
         ttk.Label(process_row, text='Окно WoW / PID:').pack(side='left')
@@ -914,7 +992,7 @@ class App:
                         variable=self.auto_focus_on_start).pack(anchor='w', pady=(0, 10))
         ttk.Label(key_group, text='Auto определяет клиент по заголовку активного окна.\n'
                   'AnyDesk / TeamViewer требуют проверки передачи клавиши на конкретном ПК.',
-                  foreground='#667085').pack(anchor='w', pady=(0, 10))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(0, 10))
         ttk.Label(key_group, text='Клавиша игры: SPACE (одна для заброса и подсечки)').pack(anchor='w')
         kr = ttk.Frame(key_group)
         kr.pack(anchor='w', pady=(10, 0))
@@ -924,23 +1002,23 @@ class App:
         ttk.Button(key_group, text='Тест SPACE через 3 секунды', command=self.test_space).pack(anchor='w', pady=(12, 2))
         ttk.Label(key_group, text='Клавиши отправляются только при активном окне WoW или удалённого клиента.\n'
                   'Если автопереключение выключено — активируй сеанс после старта. F8 — остановка.',
-                  foreground='#667085').pack(anchor='w', pady=(8, 0))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(8, 0))
         preferences = ttk.LabelFrame(remote, text='Окно приложения и системный трей', padding=12)
         preferences.pack(fill='x', pady=(8, 8))
         ttk.Label(preferences, text='При нажатии X:').pack(anchor='w')
         ttk.Radiobutton(preferences, text='Сворачивать в трей (работа продолжается)', variable=self.close_behavior, value='tray').pack(anchor='w')
         ttk.Radiobutton(preferences, text='Закрывать приложение', variable=self.close_behavior, value='exit').pack(anchor='w')
-        ttk.Label(preferences, text='Положение и размер окна восстанавливаются при следующем запуске.', foreground='#667085').pack(anchor='w', pady=(5, 0))
+        ttk.Label(preferences, text='Положение и размер окна восстанавливаются при следующем запуске.', foreground=COLORS['muted']).pack(anchor='w', pady=(5, 0))
         ttk.Label(remote, text='Глобальные горячие клавиши: Ctrl+Alt+F6 — старт/продолжить,\n'
                   'Ctrl+Alt+F7 — пауза/продолжить, Ctrl+Alt+F8 — стоп. F8 — аварийный стоп.',
-                  foreground='#667085').pack(anchor='w', pady=(10,6))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(10,6))
         ttk.Button(remote, text='Открыть папку журналов', command=self.open_log_folder).pack(anchor='w')
 
         self.component_status = tk.StringVar(value='Проверка компонентов…')
         pkgbox = ttk.LabelFrame(components, text='Диагностика зависимостей', padding=12)
         pkgbox.pack(fill='x', pady=(0, 12))
         ttk.Label(pkgbox, text='Основные пакеты устанавливаются при первом запуске. Визуальные и трей — необязательные.',
-                  wraplength=680, foreground='#667085').pack(anchor='w', pady=(0, 8))
+                  wraplength=680, foreground=COLORS['muted']).pack(anchor='w', pady=(0, 8))
         ttk.Label(pkgbox, textvariable=self.component_status, justify='left', wraplength=700).pack(anchor='w', pady=(0, 12))
         pkgbuttons = ttk.Frame(pkgbox)
         pkgbuttons.pack(fill='x')
@@ -949,12 +1027,14 @@ class App:
         self.install_button.pack(side='left', padx=(9, 0))
         ttk.Label(components, text='Установка идёт в окружение .venv этой папки. Для включения новых функций потребуется перезапустить программу.\n'
                   'Если отсутствует обязательный пакет, запусти install-components.bat.',
-                  foreground='#667085', wraplength=700).pack(anchor='w', pady=(0, 10))
+                  foreground=COLORS['muted'], wraplength=700).pack(anchor='w', pady=(0, 10))
         self.check_components()
 
         ttk.Label(logs, text='Последние события. Полный журнал — в отдельном просмотрщике.',
-                  foreground='#667085').pack(anchor='w', pady=(0, 8))
-        self.log = tk.Text(logs, height=12, state='disabled', wrap='word', font=('Consolas', 9))
+                  foreground=COLORS['muted']).pack(anchor='w', pady=(0, 8))
+        self.log = tk.Text(logs, height=12, state='disabled', wrap='word', font=('Consolas', 10))
+        style_text(self.log)
+        responsive_labels(shell)
         log_scroll = ttk.Scrollbar(logs, orient='vertical', command=self.log.yview)
         self.log.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side='right', fill='y')
@@ -1002,8 +1082,8 @@ class App:
             return
         w, h, x, y = map(int, match.groups())
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w = max(760, min(w, sw))
-        h = max(470, min(h, sh - 55))
+        w = max(820, min(w, sw))
+        h = max(520, min(h, sh - 55))
         x = max(0, min(x, max(0, sw - w)))
         y = max(0, min(y, max(0, sh - h - 40)))
         self.root.geometry(f'{w}x{h}+{x}+{y}')
@@ -1111,6 +1191,8 @@ class App:
     def update_stats(self):
         self.count.set(f'Забросов: {self.session_casts}    Поклёвок: {self.session_bites}    '
                        f'Предположительно поймано: {self.estimated_catches}')
+        for variable, value in zip(self.metric_vars, (self.session_casts, self.session_bites, self.estimated_catches)):
+            variable.set(str(value))
 
     def adjust_catches(self, delta):
         self.manual_catch_delta += delta
@@ -1185,6 +1267,9 @@ class App:
                 self.saved_sample_name = cfg.get('selected_sample', '')
                 self.threshold.set(cfg.get('threshold', .65))
                 self.timeout.set(30 if cfg.get('timeout', 30) == 25 else cfg.get('timeout', 30))  # v0.8 default migration
+                self.no_splash_stop.set(bool(cfg.get('no_splash_stop', False)))
+                self.no_splash_seconds.set(int(cfg.get('no_splash_seconds', 300)))
+                self.manual_space_reset.set(bool(cfg.get('manual_space_reset', True)))
                 self.early_bite_filter.set(bool(cfg.get('early_bite_filter', False)))
                 self.min_bite_seconds.set(int(cfg.get('min_bite_seconds', 0)))
                 self.cooldown.set(cfg.get('cooldown', 1.8))
@@ -1216,6 +1301,8 @@ class App:
                           window_geometry=self.saved_geometry or self.root.geometry(), wow_process=self.wow_process.get(),
                           audio=self.audio_name.get(), selected_sample=self.sample_file.get(), threshold=float(self.threshold.get()),
                           timeout=int(self.timeout.get()), early_bite_filter=bool(self.early_bite_filter.get()),
+                          no_splash_stop=bool(self.no_splash_stop.get()), no_splash_seconds=int(self.no_splash_seconds.get()),
+                          manual_space_reset=bool(self.manual_space_reset.get()),
                           min_bite_seconds=int(self.min_bite_seconds.get()), key_method=self.key_method.get(),
                           remote_client=self.remote_client.get(),
                           auto_focus_on_start=bool(self.auto_focus_on_start.get()),
@@ -1241,6 +1328,8 @@ class App:
     def validate_timing(config):
         if not (0 < config['threshold'] <= 1) or config['timeout'] < 3:
             raise ValueError('Threshold must be (0,1]; cast timeout >= 3 sec.')
+        if not 10 <= int(config.get('no_splash_seconds', 300)) <= 86400:
+            raise ValueError('No-splash stop must be between 10 and 86400 seconds.')
         minimum = int(config.get('min_bite_seconds', 0))
         if not (0 <= minimum <= 28):
             raise ValueError('Minimum time before bite must be between 0 and 28 seconds.')
@@ -1505,6 +1594,8 @@ class App:
             threshold = float(self.threshold.get())
             timeout = int(self.timeout.get())
             timing = dict(threshold=threshold, timeout=timeout,
+                          no_splash_stop=bool(self.no_splash_stop.get()), no_splash_seconds=int(self.no_splash_seconds.get()),
+                          manual_space_reset=bool(self.manual_space_reset.get()),
                           early_bite_filter=bool(self.early_bite_filter.get()),
                           min_bite_seconds=int(self.min_bite_seconds.get()),
                           bite_delay_min=float(self.bite_delay_min.get()),
@@ -1515,6 +1606,9 @@ class App:
             self.validate_timing(timing)
         except Exception as exc:
             messagebox.showerror('Settings', str(exc))
+            return
+        if self.automation.get() and timing['manual_space_reset'] and (not self.hotkey_listener or not self.hotkey_listener.space_hook_available):
+            messagebox.showerror('Пробел', 'Не удалось включить отслеживание ручного пробела. Отключи эту опцию или перезапусти приложение.')
             return
         self.stop.clear()
         self.paused.clear()
@@ -1552,6 +1646,7 @@ class App:
 
     def monitor(self, audio, threshold, timeout, timing, auto, method, audio_diagnostics, audio_log_interval, remote_client, mode, region, visual_threshold, local_mode, selected_pid, auto_find=False, visual_photo=''):
         com_ready = False
+        stop_reason = None
         try:
             com_ready = initialize_com()
             self.events.put(('log', 'INFO | COM initialized for monitor thread'))
@@ -1582,6 +1677,8 @@ class App:
             casts = bites = 0
             phase = 'cast'
             phase_start = time.monotonic()
+            session_started = phase_start
+            last_splash_at = None
             arm_at = phase_start + (0.0 if (auto and self.auto_focus_on_start.get() and (foreground_is_wow(selected_pid) if local_mode else foreground_is_remote(remote_client))) else (3.0 if auto else 0.0))
             last_countdown = -1
             focus_was_ok = None
@@ -1610,8 +1707,11 @@ class App:
                         while self.paused.is_set() and not self.stop.is_set():
                             time.sleep(.05)
                         shift = time.monotonic() - pause_started
+                        session_started = time.monotonic()  # Ignore keys pressed while paused.
                         phase_start += shift
                         arm_at += shift
+                        if last_splash_at is not None:
+                            last_splash_at += shift
                         if next_action_at is not None:
                             next_action_at += shift
                         if use_audio:
@@ -1622,14 +1722,12 @@ class App:
                         tracked_region = None
                         self.events.put(('log', f'HOTKEY | Resume: timers shifted by {shift:.2f}s'))
                         continue
-                    if auto and now < arm_at:
-                        seconds = max(1, int(arm_at-now)+1)
-                        if seconds != last_countdown:
-                            self.events.put(('log', f'INFO | Switching grace period: {seconds}s; activate target window'))
-                            last_countdown = seconds
-                        self.events.put(('state', f'ARMING IN {seconds}s — focus target window'))
-                        time.sleep(.10)
-                        continue
+                    if auto and timing['no_splash_stop'] and last_splash_at is not None and now - last_splash_at >= timing['no_splash_seconds']:
+                        stop_reason = f'Остановлено: нет всплесков {timing["no_splash_seconds"]} сек.'
+                        self.stop.set()
+                        self.events.put(('log', f'SAFETY | {stop_reason}'))
+                        self.events.put(('state', stop_reason))
+                        break
                     if auto:
                         focus_ok = (foreground_is_wow(selected_pid) if local_mode else foreground_is_remote(remote_client))
                         if focus_ok != focus_was_ok:
@@ -1639,12 +1737,48 @@ class App:
                             self.events.put(('state', 'PAUSED — focus target game / remote window'))
                             time.sleep(.15)
                             continue
+                    if auto and timing['manual_space_reset']:
+                        manual_at = None
+                        try:
+                            while True:
+                                pressed_at, pressed_hwnd = self.hotkey_listener.manual_spaces.get_nowait()
+                                current_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                                if pressed_at >= session_started and time.monotonic() - pressed_at < 1.0 and pressed_hwnd == current_hwnd and focus_ok:
+                                    manual_at = pressed_at
+                        except queue.Empty:
+                            pass
+                        if manual_at is not None:
+                            phase, phase_start, next_action_at = 'wait', manual_at, None
+                            arm_at = now
+                            if last_splash_at is None:
+                                last_splash_at = manual_at
+                            if use_audio:
+                                buffer.fill(0)
+                            visual_reference = None
+                            visual_confirm = 0
+                            last_audio_event = last_visual_event = -100.0
+                            tracked_region = None
+                            last_locate_at = 0.0
+                            last_early_bite_log_at = -100.0
+                            self.events.put(('log', f'INPUT | Manual SPACE; cast timer reset to {timeout}s; pending action cancelled'))
+                    if auto and now < arm_at:
+                        seconds = max(1, int(arm_at-now)+1)
+                        if seconds != last_countdown:
+                            self.events.put(('log', f'INFO | Switching grace period: {seconds}s; activate target window'))
+                            last_countdown = seconds
+                        self.events.put(('state', f'ARMING IN {seconds}s — focus target window'))
+                        time.sleep(.10)
+                        continue
                     if auto and phase == 'cast':
+                        if timing['manual_space_reset'] and not self.hotkey_listener.manual_spaces.empty():
+                            continue
                         down, up = send_space(method)
                         self.events.put(('log', f'INPUT | {method} down={down} up={up}; focus={foreground_title()!r}'))
                         casts += 1
                         phase = 'wait'
                         phase_start = time.monotonic()
+                        if last_splash_at is None:
+                            last_splash_at = phase_start
                         last_early_bite_log_at = -100.0
                         # Ignore stale audio from the preceding cast.
                         if use_audio:
@@ -1669,6 +1803,12 @@ class App:
                     else:
                         time.sleep(.12)
                     now = time.monotonic()
+                    if auto and timing['no_splash_stop'] and last_splash_at is not None and now - last_splash_at >= timing['no_splash_seconds']:
+                        stop_reason = f'Остановлено: нет всплесков {timing["no_splash_seconds"]} сек.'
+                        self.stop.set()
+                        self.events.put(('log', f'SAFETY | {stop_reason}'))
+                        self.events.put(('state', stop_reason))
+                        break
                     visual_score = -1.0
                     if use_visual and phase == 'wait' and now - phase_start > 2.5:
                         try:
@@ -1728,6 +1868,8 @@ class App:
                             visual_confirm = 0
                     else:
                         detected = audio_detect or visual_detect
+                    if auto and phase == 'wait' and detected:
+                        last_splash_at = time.monotonic()
                     score = max(audio_score if use_audio else -1.0, visual_score if use_visual else -1.0)
                     match_age = audio_age if audio_detect else (0.0 if visual_detect else audio_age)
                     if score < 0:
@@ -1806,6 +1948,8 @@ class App:
                                 f'SPACE scheduled in {delay:.2f}s'))
                             self.events.put(('state', f'BITE DETECTED ({score:.3f}) — reaction in {delay:.2f}s'))
                         elif phase == 'reaction_delay' and now >= next_action_at:
+                            if timing['manual_space_reset'] and not self.hotkey_listener.manual_spaces.empty():
+                                continue
                             down, up = send_space(method)
                             self.events.put(('log', f'INPUT | Bite SPACE: {method} down={down} up={up}; focus={foreground_title()!r}'))
                             bites += 1
@@ -1835,7 +1979,7 @@ class App:
             if com_ready:
                 ctypes.windll.ole32.CoUninitialize()
             self.events.put(('log', 'INFO | Monitor thread finished'))
-            self.events.put(('finished', None))
+            self.events.put(('finished', stop_reason))
 
     def write_log(self, message):
         line = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ' ' + message
@@ -1861,19 +2005,24 @@ class App:
             return
         win = tk.Toplevel(self.root)
         self.log_window = win
-        win.title('eGoR Fishing — diagnostic log viewer')
+        win.title('Nobrain Companion · журнал')
+        win.configure(background=COLORS['surface'])
         win.geometry('1000x570')
-        bar = ttk.Frame(win, padding=8)
+        actions = ttk.Frame(win, padding=(16, 12, 16, 4))
+        actions.pack(fill='x')
+        ttk.Label(actions, text='Журнал сессии', font=('Segoe UI', 14, 'bold')).pack(side='left')
+        ttk.Button(actions, text='Копировать', command=self.copy_visible_log).pack(side='right', padx=(8, 0))
+        ttk.Button(actions, text='Папка журналов', command=self.open_log_folder).pack(side='right')
+        bar = ttk.Frame(win, padding=(16, 6, 16, 10))
         bar.pack(fill='x')
-        ttk.Label(bar, text='Filter:').pack(side='left')
+        ttk.Label(bar, text='Фильтр', style='Muted.TLabel').pack(side='left', padx=(0, 8))
         for name in ('ALL', 'DETECT', 'AUDIO', 'TIMER', 'ERROR', 'FOCUS', 'INPUT', 'INFO'):
             ttk.Radiobutton(bar, text=name, variable=self.log_filter, value=name,
                             command=self.refresh_log_window).pack(side='left', padx=4)
-        ttk.Button(bar, text='Copy visible', command=self.copy_visible_log).pack(side='right', padx=4)
-        ttk.Button(bar, text='Open log folder', command=self.open_log_folder).pack(side='right')
         area = ttk.Frame(win)
         area.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.log_view = tk.Text(area, wrap='none', font=('Consolas', 10), state='disabled')
+        style_text(self.log_view)
         vertical = ttk.Scrollbar(area, orient='vertical', command=self.log_view.yview)
         horizontal = ttk.Scrollbar(area, orient='horizontal', command=self.log_view.xview)
         self.log_view.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -1968,7 +2117,7 @@ class App:
                 elif action == 'finished':
                     self.running = False
                     self.start_button.config(state='normal')
-                    self.state.set('Stopped')
+                    self.state.set(value or 'Stopped')
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -2010,3 +2159,4 @@ if __name__ == '__main__':
     ttk.Style(root).theme_use('clam')
     App(root)
     root.mainloop()
+
